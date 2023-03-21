@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from http import HTTPStatus
 from math import ceil
 from pathlib import Path
@@ -14,20 +15,27 @@ from loguru import logger
 from oasst_backend.api.deps import api_auth, create_api_client
 from oasst_backend.api.v1.api import api_router
 from oasst_backend.api.v1.utils import prepare_conversation
+from oasst_backend.cached_stats_repository import CachedStatsRepository
 from oasst_backend.config import settings
 from oasst_backend.database import engine
 from oasst_backend.models import message_tree_state
-from oasst_backend.prompt_repository import PromptRepository, TaskRepository, UserRepository
-from oasst_backend.tree_manager import TreeManager
+from oasst_backend.prompt_repository import PromptRepository, UserRepository
+from oasst_backend.task_repository import TaskRepository, delete_expired_tasks
+from oasst_backend.tree_manager import TreeManager, halt_prompts_of_disabled_users
 from oasst_backend.user_stats_repository import UserStatsRepository, UserStatsTimeFrame
 from oasst_backend.utils.database_utils import CommitMode, managed_tx_function
 from oasst_shared.exceptions import OasstError, OasstErrorCode
 from oasst_shared.schemas import protocol as protocol_schema
+from oasst_shared.utils import utcnow
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 from sqlmodel import Session
 from starlette.middleware.cors import CORSMiddleware
 
+# from worker.scheduled_tasks import create_task
+
 app = fastapi.FastAPI(title=settings.PROJECT_NAME, openapi_url=f"{settings.API_V1_STR}/openapi.json")
+startup_time: datetime = utcnow()
 
 
 @app.exception_handler(OasstError)
@@ -95,6 +103,13 @@ if settings.OFFICIAL_WEB_API_KEY:
                 )
 
 
+if settings.ENABLE_PROM_METRICS:
+
+    @app.on_event("startup")
+    async def enable_prom_metrics():
+        Instrumentator().instrument(app).expose(app)
+
+
 if settings.RATE_LIMIT:
 
     @app.on_event("startup")
@@ -143,6 +158,7 @@ if settings.DEBUG_USE_SEED_DATA:
 
             ur = UserRepository(db=session, api_client=api_client)
             tr = TaskRepository(db=session, api_client=api_client, client_user=dummy_user, user_repository=ur)
+            ur.update_user(tr.user_id, enabled=True, show_on_leaderboard=False, tos_acceptance=True)
             pr = PromptRepository(
                 db=session, api_client=api_client, client_user=dummy_user, user_repository=ur, task_repository=tr
             )
@@ -185,16 +201,19 @@ if settings.DEBUG_USE_SEED_DATA:
                     tr.bind_frontend_message_id(task.id, msg.task_message_id)
                     message = pr.store_text_reply(
                         msg.text,
-                        msg.lang,
+                        msg.lang or "en",
                         msg.task_message_id,
                         msg.user_message_id,
                         review_count=5,
                         review_result=True,
                         check_tree_state=False,
+                        check_duplicate=False,
                     )
                     if message.parent_id is None:
                         tm._insert_default_state(
-                            root_message_id=message.id, state=msg.tree_state or message_tree_state.State.GROWING
+                            root_message_id=message.id,
+                            lang=message.lang,
+                            state=msg.tree_state or message_tree_state.State.GROWING,
                         )
                         session.flush()
 
@@ -215,7 +234,8 @@ def ensure_tree_states():
     try:
         logger.info("Startup: TreeManager.ensure_tree_states()")
         with Session(engine) as db:
-            tm = TreeManager(db, None)
+            api_client = api_auth(settings.OFFICIAL_WEB_API_KEY, db=db)
+            tm = TreeManager(db, PromptRepository(db, api_client=api_client))
             tm.ensure_tree_states()
 
     except Exception:
@@ -266,29 +286,30 @@ def update_leader_board_total(session: Session) -> None:
         logger.exception("Error during user states update (total)")
 
 
+@app.on_event("startup")
+@repeat_every(seconds=60 * 60)  # 1 hour
+@managed_tx_function(auto_commit=CommitMode.COMMIT)
+def cronjob_delete_expired_tasks(session: Session) -> None:
+    delete_expired_tasks(session)
+    halt_prompts_of_disabled_users(session)
+
+
+@app.on_event("startup")
+@repeat_every(seconds=60 * settings.CACHED_STATS_UPDATE_INTERVAL, wait_first=True)
+@managed_tx_function(auto_commit=CommitMode.COMMIT)
+def update_cached_stats(session: Session) -> None:
+    try:
+        csr = CachedStatsRepository(session)
+        csr.update_all_cached_stats()
+    except Exception:
+        logger.exception("Error during cached stats update")
+
+
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
 
 def get_openapi_schema():
     return json.dumps(app.openapi())
-
-
-def export_ready_trees(file: Optional[str] = None, use_compression: bool = False):
-    try:
-        with Session(engine) as db:
-            api_client = api_auth(settings.OFFICIAL_WEB_API_KEY, db=db)
-            dummy_user = protocol_schema.User(id="__dummy_user__", display_name="Dummy User", auth_method="local")
-
-            ur = UserRepository(db=db, api_client=api_client)
-            tr = TaskRepository(db=db, api_client=api_client, client_user=dummy_user, user_repository=ur)
-            pr = PromptRepository(
-                db=db, api_client=api_client, client_user=dummy_user, user_repository=ur, task_repository=tr
-            )
-            tm = TreeManager(db, pr)
-
-            tm.export_all_ready_trees(file, use_compression=use_compression)
-    except Exception:
-        logger.exception("Error exporting trees.")
 
 
 def retry_scoring_failed_message_trees():
@@ -316,34 +337,28 @@ def main():
 
     parser.add_argument(
         "--print-openapi-schema",
+        default=False,
         help="Dumps the openapi schema to stdout",
-        action=argparse.BooleanOptionalAction,
+        action="store_true",
     )
     parser.add_argument("--host", help="The host to run the server", default="0.0.0.0")
     parser.add_argument("--port", help="The port to run the server", default=8080)
     parser.add_argument(
-        "--export", help="Export all trees which are ready for exporting.", action=argparse.BooleanOptionalAction
-    )
-    parser.add_argument(
-        "--export-file",
-        help="Name of file to export trees to. If not provided when exporting, output will be send to STDOUT",
-    )
-    parser.add_argument(
         "--retry-scoring",
+        default=False,
         help="Retry scoring failed message trees",
-        action=argparse.BooleanOptionalAction,
+        action="store_true",
     )
 
     args = parser.parse_args()
 
     if args.print_openapi_schema:
         print(get_openapi_schema())
-    elif args.export:
-        use_compression: bool = ".gz" in args.export_file
-        export_ready_trees(file=args.export_file, use_compression=use_compression)
-    elif args.retry_scoring:
+
+    if args.retry_scoring:
         retry_scoring_failed_message_trees()
-    else:
+
+    if not (args.print_openapi_schema or args.retry_scoring):
         uvicorn.run(app, host=args.host, port=args.port)
 
 

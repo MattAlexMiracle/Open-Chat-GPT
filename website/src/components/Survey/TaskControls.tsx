@@ -1,72 +1,80 @@
-import { Box, Flex, IconButton, Tooltip, useColorModeValue } from "@chakra-ui/react";
+import { Button, Card, Flex, IconButton, Progress, Tooltip } from "@chakra-ui/react";
 import { Edit2 } from "lucide-react";
-import { SkipButton } from "src/components/Buttons/Skip";
+import { useTranslation } from "next-i18next";
 import { SubmitButton } from "src/components/Buttons/Submit";
 import { TaskInfo } from "src/components/TaskInfo/TaskInfo";
 import { TaskStatus } from "src/components/Tasks/Task";
+import { BaseTask } from "src/types/Task";
 
 export interface TaskControlsProps {
-  // we need a task type
-  // eslint-disable-next-line  @typescript-eslint/no-explicit-any
-  task: any;
-  className?: string;
+  task: BaseTask;
   taskStatus: TaskStatus;
+  isLoading: boolean;
+  isSubmitting: boolean;
+  isRejecting: boolean;
   onEdit: () => void;
   onReview: () => void;
   onSubmit: () => void;
-  onSkip: (reason: string) => void;
+  onSkip: () => void;
 }
 
-export const TaskControls = (props: TaskControlsProps) => {
-  const backgroundColor = useColorModeValue("white", "gray.800");
+export const TaskControls = ({
+  task,
+  taskStatus,
+  isLoading,
+  isRejecting,
+  isSubmitting,
+  onEdit,
+  onReview,
+  onSubmit,
+  onSkip,
+}: TaskControlsProps) => {
+  const { t } = useTranslation();
 
   return (
-    <Box
-      width="full"
-      bg={backgroundColor}
-      borderRadius="xl"
-      p="6"
-      display="flex"
-      flexDirection={["column", "row"]}
-      shadow="base"
-      gap="4"
-    >
-      <TaskInfo id={props.task.id} output="Submit your answer" />
-      <Flex width={["full", "fit-content"]} justify="center" ml="auto" gap={2}>
-        {props.taskStatus === "REVIEW" || props.taskStatus === "SUBMITTED" ? (
-          <>
-            <Tooltip label="Edit">
-              <IconButton
-                size="lg"
-                data-cy="edit"
-                aria-label="edit"
-                onClick={props.onEdit}
-                icon={<Edit2 size="1em" />}
-              />
-            </Tooltip>
-            <SubmitButton
-              colorScheme="green"
-              data-cy="submit"
-              isDisabled={props.taskStatus === "SUBMITTED"}
-              onClick={props.onSubmit}
-            >
-              Submit
-            </SubmitButton>
-          </>
-        ) : (
-          <>
-            <SkipButton onSkip={props.onSkip} />
-            <SubmitButton
-              colorScheme="blue"
-              data-cy="review"
-              isDisabled={props.taskStatus === "NOT_SUBMITTABLE"}
-              onClick={props.onReview}
-            >
-              Review
-            </SubmitButton>
-          </>
-        )}
+    <Card>
+      {isLoading && <Progress size="sm" isIndeterminate />}
+      <Flex p="6" gap="4" direction={["column", "row"]}>
+        <TaskInfo id={task.id} output={t("submit_your_answer")} />
+        <Flex width={["full", "fit-content"]} justify="center" ml="auto" gap={2}>
+          {taskStatus.mode === "EDIT" ? (
+            <>
+              <Button size="lg" variant="outline" onClick={onSkip} isLoading={isRejecting}>
+                {t("skip")}
+              </Button>
+              <SubmitButton
+                colorScheme="blue"
+                data-cy="review"
+                isDisabled={taskStatus.replyValidity === "INVALID"}
+                onClick={onReview}
+              >
+                {t("review")}
+              </SubmitButton>
+            </>
+          ) : (
+            <>
+              <Tooltip label={t("edit")}>
+                <IconButton
+                  size="lg"
+                  data-cy="edit"
+                  aria-label={t("edit")}
+                  onClick={onEdit}
+                  icon={<Edit2 size="1em" />}
+                />
+              </Tooltip>
+              <SubmitButton
+                colorScheme="green"
+                data-cy="submit"
+                isLoading={isSubmitting}
+                isDisabled={taskStatus.mode === "SUBMITTED"}
+                onClick={onSubmit}
+              >
+                {t("submit")}
+              </SubmitButton>
+            </>
+          )}
+        </Flex>
       </Flex>
-    </Box>
+    </Card>
   );
 };

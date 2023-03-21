@@ -1,28 +1,127 @@
-import type { EmojiOp, Message } from "src/types/Conversation";
+import type { EmojiOp, FetchMessagesCursorResponse, Message } from "src/types/Conversation";
 import { LeaderboardReply, LeaderboardTimeFrame } from "src/types/Leaderboard";
+import { Stats } from "src/types/Stat";
 import type { AvailableTasks } from "src/types/Task";
+import { FetchTrollBoardResponse, TrollboardTimeFrame } from "src/types/Trollboard";
 import type { BackendUser, BackendUserCore, FetchUsersParams, FetchUsersResponse } from "src/types/Users";
 
 export class OasstError {
   message: string;
   errorCode: number;
   httpStatusCode: number;
+  path: string;
+  method: string;
 
-  constructor(message: string, errorCode: number, httpStatusCode: number) {
+  constructor({
+    errorCode,
+    httpStatusCode,
+    message,
+    path,
+    method,
+  }: {
+    message: string;
+    errorCode: number;
+    httpStatusCode: number;
+    path: string;
+    method: string;
+  }) {
     this.message = message;
     this.errorCode = errorCode;
     this.httpStatusCode = httpStatusCode;
+    this.path = path;
+    this.method = method;
+  }
+
+  toString() {
+    return JSON.stringify(this);
   }
 }
 
 export class OasstApiClient {
   oasstApiUrl: string;
   oasstApiKey: string;
+  userHeaders: Record<string, string> = {};
 
-  constructor(oasstApiUrl: string, oasstApiKey: string) {
+  constructor(oasstApiUrl: string, oasstApiKey: string, user?: BackendUserCore) {
     this.oasstApiUrl = oasstApiUrl;
     this.oasstApiKey = oasstApiKey;
+    if (user) {
+      this.userHeaders = {
+        "X-OASST-USER": `${user.auth_method}:${user.id}`,
+      };
+    }
   }
+
+  private async request<T>(method: "GET" | "POST" | "PUT" | "DELETE", path: string, init?: RequestInit): Promise<T> {
+    const resp = await fetch(`${this.oasstApiUrl}${path}`, {
+      method,
+      ...init,
+      headers: {
+        ...init?.headers,
+        ...this.userHeaders,
+        "X-API-Key": this.oasstApiKey,
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (resp.status === 204) {
+      return null as T;
+    }
+
+    if (resp.status >= 300) {
+      const errorText = await resp.text();
+      let error;
+      try {
+        error = JSON.parse(errorText);
+      } catch (e) {
+        throw new OasstError({
+          message: errorText,
+          errorCode: 0,
+          httpStatusCode: resp.status,
+          path,
+          method,
+        });
+      }
+      throw new OasstError({
+        message: error.message ?? error,
+        errorCode: error.error_code,
+        httpStatusCode: resp.status,
+        path,
+        method,
+      });
+    }
+
+    return resp.json();
+  }
+
+  private async post<T>(path: string, body: unknown) {
+    return this.request<T>("POST", path, {
+      body: JSON.stringify(body),
+    });
+  }
+
+  private async put<T>(path: string) {
+    return this.request<T>("PUT", path);
+  }
+
+  private async get<T>(path: string, query?: Record<string, string | number | boolean | undefined>) {
+    if (!query) {
+      return this.request<T>("GET", path);
+    }
+
+    const filteredQuery = Object.fromEntries(
+      Object.entries(query).filter(([, value]) => value !== undefined)
+    ) as Record<string, string>;
+
+    const params = new URLSearchParams(filteredQuery).toString();
+
+    return this.request<T>("GET", `${path}?${params}`);
+  }
+
+  private async delete<T>(path: string) {
+    return this.request<T>("DELETE", path);
+  }
+
   // TODO return a strongly typed Task?
   // This method is used to store a task in RegisteredTask.task.
   // This is a raw Json type, so we can't use it to strongly type the task.
@@ -35,15 +134,11 @@ export class OasstApiClient {
   }
 
   async ackTask(taskId: string, messageId: string): Promise<null> {
-    return this.post(`/api/v1/tasks/${taskId}/ack`, {
-      message_id: messageId,
-    });
+    return this.post(`/api/v1/tasks/${taskId}/ack`, { message_id: messageId });
   }
 
-  async nackTask(taskId: string, reason: string): Promise<null> {
-    return this.post(`/api/v1/tasks/${taskId}/nack`, {
-      reason,
-    });
+  async nackTask(taskId: string): Promise<null> {
+    return this.post(`/api/v1/tasks/${taskId}/nack`, {});
   }
 
   // TODO return a strongly typed Task?
@@ -69,6 +164,14 @@ export class OasstApiClient {
     });
   }
 
+  fetch_full_settings() {
+    return this.get<Record<string, any>>("/api/v1/admin/backend_settings/full");
+  }
+
+  fetch_public_settings() {
+    return this.get<Record<string, any>>("/api/v1/admin/backend_settings/public");
+  }
+
   /**
    * Returns the tasks availability information for given `user`.
    */
@@ -83,11 +186,54 @@ export class OasstApiClient {
     return this.get<Message>(`/api/v1/messages/${message_id}?username=${user.id}&auth_method=${user.auth_method}`);
   }
 
+  async fetch_message_tree(message_id: string, options?: { include_spam?: boolean; include_deleted?: boolean }) {
+    return this.get<{
+      id: string;
+      messages: Message[];
+    }>(`/api/v1/messages/${message_id}/tree`, options);
+  }
+
+  /**
+   *  Returns the Message's tree state
+   */
+  async fetch_message_tree_state(message_id: string) {
+    return this.get<{
+      message_tree_id: string;
+      state: string;
+      active: boolean;
+      goal_tree_size: number;
+      max_children_count: number;
+      max_depth: number;
+      origin: string;
+    }>(`/api/v1/messages/${message_id}/tree/state`);
+  }
+
+  /**
+   * Delete a message by its id
+   */
+  async delete_message(message_id: string): Promise<void> {
+    return this.delete<void>(`/api/v1/messages/${message_id}`);
+  }
+
+  /**
+   * Undelete a message by its id
+   */
+  async undelete_message(message_id: string): Promise<void> {
+    return this.put<void>(`/api/v1/messages/${message_id}/undelete`);
+  }
+
+  /**
+   * Stop message tree
+   */
+  async stop_tree(message_id: string): Promise<void> {
+    return this.put<void>(`/api/v1/messages/${message_id}/tree/state?halt=true`);
+  }
+
   /**
    * Send a report about a message
    */
   async send_report(message_id: string, user: BackendUserCore, text: string) {
-    return this.post("/api/v1/text_labels", {
+    return this.post("/api/v1/text_labels/", {
       type: "text_labels",
       message_id,
       labels: [], // Not yet implemented
@@ -95,6 +241,13 @@ export class OasstApiClient {
       is_report: true,
       user,
     });
+  }
+
+  /**
+   * Returns cached dataset stats from the backend.
+   */
+  async fetch_cached_stats(): Promise<Stats> {
+    return this.get("/api/v1/stats/cached");
   }
 
   /**
@@ -144,18 +297,40 @@ export class OasstApiClient {
     return this.get<Message[]>(`/api/v1/users/${user_id}/messages`);
   }
 
+  async fetch_user_messages_cursor(
+    user_id: string,
+    {
+      direction,
+      cursor,
+      ...rest
+    }: { include_deleted?: boolean; max_count?: number; cursor?: string; direction: "forward" | "back"; desc?: boolean }
+  ) {
+    return this.get<FetchMessagesCursorResponse>(`/api/v1/users/${user_id}/messages/cursor`, {
+      ...rest,
+      after: direction === "forward" ? cursor : undefined,
+      before: direction === "back" ? cursor : undefined,
+    });
+  }
+
   /**
    * Updates the backend's knowledge about the `user_id`.
    */
-  async set_user_status(user_id: string, is_enabled: boolean, notes: string): Promise<void> {
-    await this.put(`/api/v1/users/users/${user_id}?enabled=${is_enabled}&notes=${notes}`);
+  async set_user_status(
+    user_id: string,
+    is_enabled: boolean,
+    notes: string,
+    show_on_leaderboard: boolean
+  ): Promise<void> {
+    await this.put(
+      `/api/v1/users/${user_id}?enabled=${is_enabled}&notes=${notes}&show_on_leaderboard=${show_on_leaderboard}`
+    );
   }
 
   /**
    * Returns the valid labels for messages.
    */
-  async fetch_valid_text(): Promise<any> {
-    return this.get(`/api/v1/text_labels/valid_labels`);
+  async fetch_valid_text(messageId?: string): Promise<any> {
+    return this.get("/api/v1/text_labels/valid_labels", { message_id: messageId });
   }
 
   /**
@@ -186,61 +361,98 @@ export class OasstApiClient {
     });
   }
 
-  private async post<T>(path: string, body: unknown) {
-    return this.request<T>("POST", path, {
-      body: JSON.stringify(body),
+  fetch_my_messages(user: BackendUserCore) {
+    const params = new URLSearchParams({
+      username: user.id,
+      auth_method: user.auth_method,
+    });
+    return this.get<Message[]>(`/api/v1/messages?${params}`);
+  }
+
+  fetch_my_messages_cursor(
+    user: BackendUserCore,
+    {
+      direction,
+      cursor,
+      ...rest
+    }: { include_deleted?: boolean; max_count?: number; cursor?: string; direction: "forward" | "back"; desc?: boolean }
+  ) {
+    return this.get<FetchMessagesCursorResponse>(`/api/v1/messages/cursor`, {
+      ...rest,
+      username: user.id,
+      auth_method: user.auth_method,
+      after: direction === "forward" ? cursor : undefined,
+      before: direction === "back" ? cursor : undefined,
     });
   }
 
-  private async put<T>(path: string) {
-    return this.request<T>("PUT", path);
+  fetch_recent_messages(lang: string) {
+    return this.get<Message[]>(`/api/v1/messages`, { lang });
   }
 
-  private async get<T>(path: string, query?: Record<string, string | number | boolean | undefined>) {
-    if (!query) {
-      return this.request<T>("GET", path);
-    }
-
-    const filteredQuery = Object.fromEntries(
-      Object.entries(query).filter(([, value]) => value !== undefined)
-    ) as Record<string, string>;
-
-    const params = new URLSearchParams(filteredQuery).toString();
-
-    return this.request<T>("GET", `${path}?${params}`);
+  fetch_message_children(messageId: string) {
+    return this.get<Message[]>(`/api/v1/messages/${messageId}/children`);
   }
 
-  private async request<T>(method: "GET" | "POST" | "PUT", path: string, init?: RequestInit): Promise<T | null> {
-    const resp = await fetch(`${this.oasstApiUrl}${path}`, {
-      method,
-      ...init,
-      headers: {
-        "X-API-Key": this.oasstApiKey,
-        "Content-Type": "application/json",
-        ...init?.headers,
-      },
+  fetch_conversation(messageId: string) {
+    return this.get(`/api/v1/messages/${messageId}/conversation`);
+  }
+
+  async fetch_tos_acceptance(backendUserCore: BackendUserCore): Promise<BackendUser["tos_acceptance_date"]> {
+    const user = await this.fetch_frontend_user(backendUserCore);
+    return user.tos_acceptance_date;
+  }
+
+  async set_tos_acceptance(user: BackendUserCore) {
+    // NOTE: we do a post here to force create the user if it does not exist
+    const backendUser = await this.post<BackendUser>(`/api/v1/frontend_users/`, user);
+    await this.put<void>(`/api/v1/users/${backendUser.user_id}?tos_acceptance=true`);
+  }
+
+  async fetch_user_stats(user: BackendUserCore) {
+    const backendUser = await this.get<BackendUser>(`/api/v1/frontend_users/${user.auth_method}/${user.id}`);
+    return this.get(`/api/v1/users/${backendUser.user_id}/stats`);
+  }
+
+  fetch_user_stats_window(user_id: string, time_frame: LeaderboardTimeFrame, window_size?: number) {
+    return this.get<LeaderboardReply>(`/api/v1/users/${user_id}/stats/${time_frame}/window`, {
+      window_size,
     });
+  }
 
-    if (resp.status === 204) {
-      return null;
-    }
+  fetch_frontend_user(user: BackendUserCore) {
+    return this.get<BackendUser>(`/api/v1/frontend_users/${user.auth_method}/${user.id}`);
+  }
 
-    if (resp.status >= 300) {
-      const errorText = await resp.text();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let error: any;
-      try {
-        error = JSON.parse(errorText);
-      } catch (e) {
-        throw new OasstError(errorText, 0, resp.status);
-      }
-      throw new OasstError(error.message ?? error, error.error_code, resp.status);
-    }
+  fetch_trollboard(time_frame: TrollboardTimeFrame, { limit, enabled }: { limit?: number; enabled?: boolean }) {
+    return this.get<FetchTrollBoardResponse>(`/api/v1/trollboards/${time_frame}`, {
+      max_count: limit,
+      enabled: enabled,
+    });
+  }
 
-    return await resp.json();
+  fetch_messages_cursor({
+    direction,
+    cursor,
+    ...rest
+  }: {
+    direction: "back" | "forward";
+    cursor?: string;
+    user_id?: string;
+    auth_method?: string;
+    username?: string;
+    api_client_id?: string;
+    only_roots?: boolean;
+    include_deleted?: boolean;
+    max_count?: number;
+    desc?: boolean;
+    lang?: string;
+    include_user?: boolean;
+  }) {
+    return this.get<FetchMessagesCursorResponse>("/api/v1/messages/cursor", {
+      ...rest,
+      after: direction === "forward" ? cursor : undefined,
+      before: direction === "back" ? cursor : undefined,
+    });
   }
 }
-
-const oasstApiClient = new OasstApiClient(process.env.FASTAPI_URL, process.env.FASTAPI_KEY);
-
-export { oasstApiClient };

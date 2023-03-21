@@ -8,22 +8,23 @@ import torch
 from models import RankGenModel
 from rank_datasets import DataCollatorForPairRank, RankGenCollator
 from torch import nn
-from transformers import (
-    AdamW,
-    AutoModelForSequenceClassification,
-    PreTrainedModel,
-    Trainer,
-    TrainingArguments,
-    get_cosine_schedule_with_warmup,
-    get_linear_schedule_with_warmup,
-)
+from transformers import AutoModelForSequenceClassification, PreTrainedModel, Trainer, TrainingArguments
+from transformers.training_args import OptimizerNames
 from utils import argument_parsing, freeze_top_n_layers, get_datasets, get_tokenizer
 
 os.environ["WANDB_PROJECT"] = "reward-model"
 
 accuracy = evaluate.load("accuracy")
 parser = ArgumentParser()
+# Note, these override the config yaml, and get merged in argument_parsing() in utils.py
+# Do not set defaults here, but set them in utils.py so that the config yaml can override them.
 parser.add_argument("config", type=str)
+parser.add_argument("--local_rank", type=int)
+parser.add_argument("--deepspeed", action="store_true")
+parser.add_argument("--no-deepspeed", dest="deepspeed", action="store_false")
+parser.add_argument("--wandb-entity", type=str)
+parser.add_argument("--per-digit-tokens", action="store_true")
+parser.add_argument("--output_dir", type=str)
 
 
 def compute_metrics(eval_pred):
@@ -66,8 +67,9 @@ class RankTrainer(Trainer):
                 loss = self.loss_fct(positive_outputs, negative_outputs)
             else:
                 raise NotImplementedError("Only ranking loss has been implemented for rankgen model")
-            outputs = torch.hstack((positive_outputs, negative_outputs))  # logits
+            outputs = torch.hstack((positive_outputs[:, None], negative_outputs[:, None]))
         else:
+            inputs.pop("token_type_ids", None)
             outputs = model(**inputs)
             logits = outputs.get("logits").view(-1, 2)
             if self.loss_function == "rank":
@@ -104,18 +106,19 @@ class RankTrainer(Trainer):
                     loss = self.loss_fct(positive_outputs, negative_outputs)
                 else:
                     raise NotImplementedError("Only ranking loss has been implemented for rankgen model")
-                outputs = torch.hstack((positive_outputs, negative_outputs))  # logits
-                return (loss, outputs, None)
+                logits = torch.hstack((positive_outputs[:, None], negative_outputs[:, None]))
+                # Create labels which are not None so HF will call compute_metrics:
+                labels = torch.zeros(logits.shape[0], device=logits.device, dtype=torch.long)
+                return loss, logits, labels
             else:
-                # compute loss on predict data
                 loss, logits = self._compute_loss(model, inputs)
 
                 loss = loss.mean().detach()
                 labels = torch.zeros(logits.shape[0], device=logits.device, dtype=torch.long)
                 if self.args.prediction_loss_only:
-                    return (loss, None, None)
+                    return loss, None, None
 
-                return (loss, logits, labels)
+                return loss, logits, labels
 
 
 if __name__ == "__main__":
@@ -133,48 +136,50 @@ if __name__ == "__main__":
         params = sum([np.prod(p.size()) for p in model_parameters])
         print("Number of trainable : {}M".format(int(params / 1e6)))
 
+    optimizer = OptimizerNames.ADAMW_HF
     args = TrainingArguments(
-        output_dir=f"{model_name}-finetuned",
+        output_dir=training_conf["output_dir"],
         num_train_epochs=training_conf["num_train_epochs"],
-        warmup_steps=500,
+        warmup_steps=training_conf["warmup_steps"],
+        optim=optimizer,
+        # lr_scheduler_type=training_conf["scheduler"],
         learning_rate=training_conf["learning_rate"],
         # half_precision_backend="apex",
+        deepspeed="configs/zero_config.json" if training_conf["deepspeed"] else None,
         fp16=training_conf["fp16"],
+        local_rank=training_conf["local_rank"],
         gradient_checkpointing=training_conf["gradient_checkpointing"],
         gradient_accumulation_steps=training_conf["gradient_accumulation_steps"],
         per_device_train_batch_size=training_conf["per_device_train_batch_size"],
         per_device_eval_batch_size=training_conf["per_device_eval_batch_size"],
-        weight_decay=0.01,
-        max_grad_norm=2.0,
+        weight_decay=training_conf["weight_decay"],
+        max_grad_norm=training_conf["max_grad_norm"],
         logging_steps=10,
         save_total_limit=4,
         evaluation_strategy="steps",
         eval_steps=training_conf["eval_steps"],
-        save_steps=1000,
+        save_steps=training_conf["save_steps"],
         report_to="wandb",
     )
 
-    tokenizer = get_tokenizer(training_conf["tokenizer_name"])
-    train, evals = get_datasets(training_conf["datasets"])
+    tokenizer = get_tokenizer(training_conf["tokenizer_name"], training_conf["per_digit_tokens"])
+    train, evals = get_datasets(training_conf["datasets"], tokenizer)
     if "rankgen" in model_name:
         collate_fn = RankGenCollator(tokenizer, max_length=training_conf["max_length"])
     else:
-        collate_fn = DataCollatorForPairRank(tokenizer, max_length=training_conf["max_length"])
+        collate_fn = DataCollatorForPairRank(
+            tokenizer,
+            max_length=training_conf["max_length"],
+            drop_token_type=training_conf.get("drop_token_type", False),
+        )
     assert len(evals) > 0
 
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    scheduler = None
-    if "scheduler" in training_conf:
-        if training_conf["scheduler"] == "linear":
-            scheduler = get_linear_schedule_with_warmup()
-        elif training_conf["scheduler"] == "cosine":
-            scheduler = get_cosine_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=args.warmup_steps,
-                num_training_steps=len(train)
-                * args.num_train_epochs
-                / (args.per_device_train_batch_size * args.gradient_accumulation_steps),
-            )
+    if not training_conf["deepspeed"] or training_conf["local_rank"] == 0:
+        import wandb
+
+        wandb.init(
+            project=os.environ["WANDB_PROJECT"], name=f"{model_name}-finetuned", entity=training_conf["wandb_entity"]
+        )
 
     trainer = RankTrainer(
         model=model,
@@ -182,11 +187,11 @@ if __name__ == "__main__":
         args=args,
         loss_function=training_conf["loss"],
         train_dataset=train,
-        eval_dataset=evals,
+        eval_dataset=torch.utils.data.ConcatDataset(evals.values()),
         data_collator=collate_fn,
         tokenizer=tokenizer,
         compute_metrics=compute_metrics,
-        optimizers=(optimizer, scheduler),
+        # optimizers=(optimizer, scheduler),
     )
-    # trainer.evaluate()
     trainer.train()
+    trainer.evaluate()

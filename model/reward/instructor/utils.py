@@ -3,6 +3,7 @@ from typing import AnyStr, List
 
 import yaml
 from sklearn.model_selection import train_test_split
+from tokenizers import pre_tokenizers
 from torch.utils.data import Subset
 from transformers import AutoTokenizer, T5Tokenizer
 
@@ -26,13 +27,16 @@ def webgpt_return_format(row):
     }
 
 
-def get_tokenizer(tokenizer_name):
+def get_tokenizer(tokenizer_name, per_digit_tokens=False):
     if "t5" in tokenizer_name:  # rankgen
         tokenizer = T5Tokenizer.from_pretrained(tokenizer_name, truncation_side="left")
     else:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     if "galactica" in tokenizer_name:
         tokenizer.add_special_tokens({"pad_token": "<pad>", "eos_token": "</s>"})
+
+    if per_digit_tokens:
+        tokenizer._tokenizer.pre_processor = pre_tokenizers.Digits(True)
 
     return tokenizer
 
@@ -81,26 +85,49 @@ def argument_parsing(parser):
         "learning_rate": 3e-5,
         "eval_steps": 500,
         "loss": "rank",
+        "warmup_steps": 500,
         "max_length": 440,
+        "weight_decay": 0.01,
+        "max_grad_norm": 2.0,
+        "save_steps": 500,
         "per_device_eval_batch_size": 5,
         "per_device_train_batch_size": 8,
         "gradient_accumulation_steps": 8,
         "gradient_checkpointing": False,
+        "deepspeed": False,
+        "local_rank": -1,
         "datasets": ["webgpt"],
+        "wandb_entity": "open-assistant",
+        "per_digit_tokens": False,
         "fp16": True,
         "tokenizer_name": training_conf["model_name"],
+        "output_dir": "output",
     }
+    args_without_none = {k: v for (k, v) in vars(args).items() if v is not None}
+    if not args_without_none["per_digit_tokens"]:  # Don't let missing command line override the conf
+        del args_without_none["per_digit_tokens"]
 
-    params = {**default_params, **training_conf}
-    params["gradient_accumulation_steps"] = int(params["gradient_accumulation_steps"])
-    params["num_train_epochs"] = int(params["num_train_epochs"])
-    params["per_device_train_batch_size"] = int(params["per_device_train_batch_size"])
-    params["learning_rate"] = float(params["learning_rate"])
+    # Apply default params, then yaml config, then command line args where specific (i.e. not None)
+    params = {**default_params, **training_conf, **args_without_none}
+    for name in [
+        "gradient_accumulation_steps",
+        "num_train_epochs",
+        "save_steps",
+        "eval_steps",
+        "per_device_train_batch_size",
+        "per_device_eval_batch_size",
+    ]:
+        params[name] = int(params[name])
+    for name in ["learning_rate", "weight_decay", "max_grad_norm"]:
+        params[name] = float(params[name])
+
+    print("params", params)
+
     return params
 
 
-def get_datasets(dataset_list: List[AnyStr]):
-    from rank_datasets import GPTJSynthetic, HFSummary, WebGPT
+def get_datasets(dataset_list: List[AnyStr], tokenizer):
+    from rank_datasets import AnthropicRLHF, GPTJSynthetic, HFSummary, OAPrivate, WebGPT
     from torch.utils.data import ConcatDataset
 
     train_datasets, evals = [], {}
@@ -121,13 +148,16 @@ def get_datasets(dataset_list: List[AnyStr]):
             train, eval = train_val_dataset(dataset, 0.1)
             train_datasets.append(train)
             evals["gptsynthetic"] = eval
+        elif "anthropic_rlhf" == dataset_name:
+            train = AnthropicRLHF("train", tokenizer.sep_token)
+            eval = AnthropicRLHF("test", tokenizer.sep_token)
+            train_datasets.append(train)
+            evals["anthropic_rlhf"] = eval
+        elif "oa_private" == dataset_name:
+            train = OAPrivate(split="train", sep_token=tokenizer.sep_token)
+            eval = OAPrivate(split="val", sep_token=tokenizer.sep_token)
+            train_datasets.append(train)
+            evals["oa_private"] = eval
+
     train = ConcatDataset(train_datasets)
     return train, evals
-
-
-if __name__ == "__main__":
-    from transformers import AutoModelForSequenceClassification
-
-    model = AutoModelForSequenceClassification.from_pretrained("bigscience/bloomz-560m")
-    freeze_top_n_layers(model, 10)
-    print(model.state_dict().keys())
